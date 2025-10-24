@@ -24,7 +24,7 @@ def health():
 def get_visitor_stats(blog_id):
     """
     네이버 블로그의 방문자 통계 가져오기
-    NVisitorgp4Ajax.nhn API 사용
+    NVisitorgp4Ajax.nhn API 사용 (XML 응답)
     """
     try:
         print(f"[방문자 통계] {blog_id} 조회 시작")
@@ -45,78 +45,61 @@ def get_visitor_stats(blog_id):
         
         print(f"[방문자 통계] API 응답 코드: {response.status_code}")
         
-        # HTML 파싱
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 방문자 데이터 추출
-        visitor_stats = []
-        
-        # 방법 1: JavaScript 변수에서 데이터 추출 (가장 확실)
-        scripts = soup.find_all('script')
-        print(f"[방문자 통계] 스크립트 태그 {len(scripts)}개 발견")
-        
-        for script in scripts:
-            if script.string:
-                # aVisitor 배열 찾기 - 네이버 블로그가 사용하는 변수명
-                match = re.search(r'aVisitor\s*=\s*\[([^\]]+)\]', script.string)
-                if match:
-                    try:
-                        numbers_str = match.group(1)
-                        print(f"[방문자 통계] aVisitor 발견: {numbers_str[:100]}")
-                        # 쉼표로 구분된 숫자들 파싱
-                        numbers = [int(x.strip()) for x in numbers_str.split(',') if x.strip().replace('-', '').isdigit()]
-                        
-                        if numbers:
-                            print(f"[방문자 통계] 파싱된 숫자: {numbers}")
-                            visitor_stats = format_visitor_array(numbers)
-                            break
-                    except Exception as e:
-                        print(f"[방문자 통계] aVisitor 파싱 실패: {e}")
-                        continue
+        # XML 파싱
+        try:
+            root = ET.fromstring(response.content)
+            print(f"[방문자 통계] XML 파싱 성공")
+            
+            # visitorcnts > visitorcnt 요소들 찾기
+            visitor_elements = root.findall('.//visitorcnt')
+            print(f"[방문자 통계] visitorcnt 요소 {len(visitor_elements)}개 발견")
+            
+            if not visitor_elements:
+                # visitorcnts가 아니라 visitorcnt가 직접 있을 수도 있음
+                visitor_elements = root.findall('.//visitorcnt')
+            
+            if visitor_elements:
+                visitor_stats = []
+                today = datetime.now()
                 
-                # 다른 변수명 시도 (visitor, visitorCnt 등)
-                match = re.search(r'var\s+(visitor\w*|aVisit\w*)\s*=\s*\[([^\]]+)\]', script.string, re.IGNORECASE)
-                if match and not visitor_stats:
-                    try:
-                        numbers_str = match.group(2)
-                        print(f"[방문자 통계] 다른 변수 발견: {numbers_str[:100]}")
-                        numbers = [int(x.strip()) for x in numbers_str.split(',') if x.strip().replace('-', '').isdigit()]
+                # 최근 5개만 사용
+                recent_elements = visitor_elements[-5:] if len(visitor_elements) > 5 else visitor_elements
+                
+                for i, elem in enumerate(recent_elements):
+                    cnt = elem.get('cnt')
+                    date_id = elem.get('id')
+                    
+                    if cnt:
+                        # 날짜 계산
+                        days_ago = len(recent_elements) - 1 - i
+                        date = (today - timedelta(days=days_ago)).strftime('%Y-%m-%d')
                         
-                        if numbers:
-                            print(f"[방문자 통계] 파싱된 숫자: {numbers}")
-                            visitor_stats = format_visitor_array(numbers)
-                            break
-                    except:
-                        continue
+                        visitor_stats.append({
+                            'date': date,
+                            'visitors': int(cnt)
+                        })
+                
+                print(f"[방문자 통계] 성공: {len(visitor_stats)}일치 데이터")
+                print(f"[방문자 통계] 데이터: {visitor_stats}")
+                
+                if visitor_stats:
+                    return jsonify({
+                        'blog_id': blog_id,
+                        'stats': visitor_stats,
+                        'success': True
+                    })
         
-        # 방법 2: HTML에서 직접 숫자 추출 (fallback)
-        if not visitor_stats:
-            print(f"[방문자 통계] JavaScript 변수 없음, HTML 파싱 시도")
-            # 모든 텍스트에서 숫자 패턴 찾기
-            all_text = soup.get_text()
-            number_pattern = re.findall(r'\d+', all_text)
-            if number_pattern:
-                # 방문자 수로 보이는 숫자들 (보통 0~10000 사이)
-                numbers = [int(n) for n in number_pattern if 0 <= int(n) <= 10000]
-                print(f"[방문자 통계] HTML에서 추출한 숫자: {numbers[:10]}")
-                if len(numbers) >= 5:
-                    visitor_stats = format_visitor_array(numbers[-5:])
+        except ET.ParseError as e:
+            print(f"[방문자 통계] XML 파싱 실패: {e}")
         
-        if visitor_stats:
-            print(f"[방문자 통계] 성공: {len(visitor_stats)}일치 데이터")
-            return jsonify({
-                'blog_id': blog_id,
-                'stats': visitor_stats,
-                'success': True
-            })
-        else:
-            print(f"[방문자 통계] 실패: 데이터 없음")
-            return jsonify({
-                'blog_id': blog_id,
-                'stats': [],
-                'success': False,
-                'message': '방문자 데이터를 찾을 수 없습니다. 방문자 그래프 위젯이 활성화되어 있는지 확인하세요.'
-            })
+        # 파싱 실패
+        print(f"[방문자 통계] 실패: 데이터 없음")
+        return jsonify({
+            'blog_id': blog_id,
+            'stats': [],
+            'success': False,
+            'message': '방문자 데이터를 찾을 수 없습니다. 방문자 그래프 위젯이 활성화되어 있는지 확인하세요.'
+        })
         
     except requests.exceptions.RequestException as e:
         print(f"[방문자 통계] 네트워크 오류: {e}")
