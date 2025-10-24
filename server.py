@@ -142,10 +142,10 @@ def format_visitor_array(numbers):
 
 @app.route('/api/recent-posts/<blog_id>', methods=['GET'])
 def get_recent_posts(blog_id):
-    """네이버 블로그의 최신 게시글 가져오기 (RSS 피드 사용)"""
+    """네이버 블로그의 최신 게시글 가져오기 (RSS 피드 사용) - 최대 5개"""
     try:
-        limit = request.args.get('limit', 5, type=int)
-        limit = min(limit, 20)
+        # 최대 5개로 고정
+        limit = 5
         
         rss_url = f'https://rss.blog.naver.com/{blog_id}.xml'
         
@@ -181,14 +181,15 @@ def get_recent_posts(blog_id):
                     
                     if date_elem is not None and date_elem.text:
                         try:
+                            # RSS pubDate 형식: "Wed, 23 Oct 2024 14:30:00 +0900"
                             date_str = date_elem.text
-                            date_parts = date_str.split()
-                            if len(date_parts) >= 4:
-                                date_formatted = f"{date_parts[1]} {date_parts[2]} {date_parts[3]}"
-                            else:
-                                date_formatted = date_str[:16]
+                            # RFC 2822 형식 파싱
+                            dt = datetime.strptime(date_str, '%a, %d %b %Y %H:%M:%S %z')
+                            # ISO 형식으로 변환
+                            date_formatted = dt.isoformat()
                         except:
-                            date_formatted = date_elem.text[:16]
+                            # 파싱 실패시 원본 그대로
+                            date_formatted = date_elem.text
                     else:
                         date_formatted = 'Unknown'
                     
@@ -233,7 +234,11 @@ def check_exposure():
         post_url = data.get('post_url')
         
         if not all([blog_id, post_title, post_url]):
-            return jsonify({'error': '필수 파라미터가 누락되었습니다.'}), 400
+            return jsonify({
+                'error': '필수 파라미터가 누락되었습니다.',
+                'exposed': False,
+                'success': False
+            }), 400
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -266,8 +271,29 @@ def check_exposure():
                     print(f"✓ 노출됨: {post_title[:30]}...")
                     break
         
+        except requests.exceptions.Timeout:
+            print(f"⏱ 타임아웃: {post_title[:30]}...")
+            return jsonify({
+                'blog_id': blog_id,
+                'post_title': post_title,
+                'post_url': post_url,
+                'exposed': False,
+                'success': True,
+                'checked_at': datetime.now().isoformat(),
+                'timeout': True
+            })
+        
         except Exception as e:
             print(f"VIEW 검색 중 오류: {e}")
+            return jsonify({
+                'blog_id': blog_id,
+                'post_title': post_title,
+                'post_url': post_url,
+                'exposed': False,
+                'success': True,
+                'checked_at': datetime.now().isoformat(),
+                'error_detail': str(e)
+            })
         
         if not exposed:
             print(f"✗ 누락됨: {post_title[:30]}...")
@@ -277,6 +303,7 @@ def check_exposure():
             'post_title': post_title,
             'post_url': post_url,
             'exposed': exposed,
+            'success': True,
             'checked_at': datetime.now().isoformat()
         })
         
@@ -284,7 +311,8 @@ def check_exposure():
         print(f"검색 확인 중 치명적 오류: {e}")
         return jsonify({
             'error': f'검색 확인 중 오류: {str(e)}',
-            'exposed': None
+            'exposed': False,
+            'success': False
         }), 500
 
 
