@@ -13,61 +13,82 @@ CORS(app)
 @app.route('/health', methods=['GET'])
 def health():
     """서버 상태 확인"""
-    return jsonify({'status': 'ok', 'message': '네이버 블로그 트래커 API 서버가 정상 작동 중입니다.'})
+    return jsonify({
+        'status': 'ok', 
+        'message': '네이버 블로그 트래커 API 서버가 정상 작동 중입니다.',
+        'timestamp': datetime.now().isoformat()
+    })
 
 
 @app.route('/api/visitor-stats/<blog_id>', methods=['GET'])
 def get_visitor_stats(blog_id):
     """
     네이버 블로그의 방문자 통계 가져오기
+    NVisitorgp4Ajax.nhn API 사용
     """
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept': '*/*',
             'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
-            'Referer': f'https://blog.naver.com/{blog_id}'
+            'Referer': f'https://blog.naver.com/{blog_id}',
+            'X-Requested-With': 'XMLHttpRequest'
         }
         
-        # 방문자 통계 위젯 URL (네이버 블로그 위젯 API)
-        widget_url = f'https://blog.naver.com/widgetblogstats.nhn?blogId={blog_id}'
+        # 네이버 방문자 통계 Ajax API
+        visitor_url = f'https://blog.naver.com/NVisitorgp4Ajax.nhn?blogId={blog_id}'
         
-        response = requests.get(widget_url, headers=headers, timeout=10)
+        response = requests.get(visitor_url, headers=headers, timeout=10)
         response.raise_for_status()
         
         # HTML 파싱
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 방문자 데이터 추출 시도
+        # 방문자 데이터 추출
         visitor_stats = []
         
-        # 방법 1: JavaScript 변수에서 데이터 추출
+        # 방법 1: JavaScript 변수에서 데이터 추출 (가장 확실)
         scripts = soup.find_all('script')
         for script in scripts:
             if script.string:
-                # visitorCntList 같은 변수 찾기
-                match = re.search(r'var\s+\w*[Vv]isitor\w*\s*=\s*(\[.*?\]);', script.string, re.DOTALL)
+                # aVisitor 배열 찾기 - 네이버 블로그가 사용하는 변수명
+                match = re.search(r'aVisitor\s*=\s*\[([^\]]+)\]', script.string)
                 if match:
                     try:
-                        data = json.loads(match.group(1))
-                        visitor_stats = format_visitor_data(data)
-                        break
-                    except:
+                        numbers_str = match.group(1)
+                        # 쉼표로 구분된 숫자들 파싱
+                        numbers = [int(x.strip()) for x in numbers_str.split(',') if x.strip().replace('-', '').isdigit()]
+                        
+                        if numbers:
+                            visitor_stats = format_visitor_array(numbers)
+                            break
+                    except Exception as e:
+                        print(f"aVisitor 파싱 실패: {e}")
                         continue
                 
-                # 다른 형태의 데이터 구조
-                match = re.search(r'visitorData\s*:\s*(\[.*?\])', script.string, re.DOTALL)
-                if match:
+                # 다른 변수명 시도 (visitor, visitorCnt 등)
+                match = re.search(r'var\s+(visitor\w*|aVisit\w*)\s*=\s*\[([^\]]+)\]', script.string, re.IGNORECASE)
+                if match and not visitor_stats:
                     try:
-                        data = json.loads(match.group(1))
-                        visitor_stats = format_visitor_data(data)
-                        break
+                        numbers_str = match.group(2)
+                        numbers = [int(x.strip()) for x in numbers_str.split(',') if x.strip().replace('-', '').isdigit()]
+                        
+                        if numbers:
+                            visitor_stats = format_visitor_array(numbers)
+                            break
                     except:
                         continue
         
-        # 방법 2: 테이블에서 직접 파싱
+        # 방법 2: HTML에서 직접 숫자 추출 (fallback)
         if not visitor_stats:
-            visitor_stats = extract_from_table(soup)
+            # 모든 텍스트에서 숫자 패턴 찾기
+            all_text = soup.get_text()
+            number_pattern = re.findall(r'\d+', all_text)
+            if number_pattern:
+                # 방문자 수로 보이는 숫자들 (보통 0~10000 사이)
+                numbers = [int(n) for n in number_pattern if 0 <= int(n) <= 10000]
+                if len(numbers) >= 5:
+                    visitor_stats = format_visitor_array(numbers[-5:])
         
         if visitor_stats:
             return jsonify({
@@ -80,9 +101,16 @@ def get_visitor_stats(blog_id):
                 'blog_id': blog_id,
                 'stats': [],
                 'success': False,
-                'message': '방문자 그래프 위젯이 설정되어 있지 않거나 데이터를 찾을 수 없습니다.'
+                'message': '방문자 데이터를 찾을 수 없습니다. 방문자 그래프 위젯이 활성화되어 있는지 확인하세요.'
             })
         
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            'error': f'네트워크 오류: {str(e)}',
+            'blog_id': blog_id,
+            'stats': [],
+            'success': False
+        }), 500
     except Exception as e:
         return jsonify({
             'error': f'방문자 통계를 가져올 수 없습니다: {str(e)}',
@@ -92,56 +120,23 @@ def get_visitor_stats(blog_id):
         }), 500
 
 
-def format_visitor_data(data):
-    """방문자 데이터 포맷팅"""
+def format_visitor_array(numbers):
+    """숫자 배열을 방문자 통계 포맷으로 변환"""
     stats = []
     today = datetime.now()
     
-    if isinstance(data, list):
-        for i, count in enumerate(data[-5:]):  # 최근 5일
-            date = (today - timedelta(days=4-i)).strftime('%Y-%m-%d')
-            if isinstance(count, dict):
-                visitors = count.get('count', 0) or count.get('visitors', 0)
-            else:
-                visitors = int(count) if count else 0
-            
-            stats.append({
-                'date': date,
-                'visitors': visitors
-            })
+    # 최근 5개 데이터 사용 (또는 전체)
+    recent_numbers = numbers[-5:] if len(numbers) > 5 else numbers
     
-    return stats
-
-
-def extract_from_table(soup):
-    """테이블 형태에서 방문자 데이터 추출"""
-    stats = []
-    today = datetime.now()
-    
-    try:
-        # 방문자 수가 표시된 요소 찾기
-        visitor_elements = soup.find_all(text=re.compile(r'\d+'))
+    for i, count in enumerate(recent_numbers):
+        # 오늘부터 역순으로 날짜 계산
+        days_ago = len(recent_numbers) - 1 - i
+        date = (today - timedelta(days=days_ago)).strftime('%Y-%m-%d')
         
-        # 숫자만 추출
-        numbers = []
-        for elem in visitor_elements[:10]:  # 최대 10개
-            try:
-                num = int(re.search(r'\d+', elem).group())
-                if num > 0:
-                    numbers.append(num)
-            except:
-                continue
-        
-        # 최근 5일치 데이터 생성
-        if len(numbers) >= 5:
-            for i, count in enumerate(numbers[-5:]):
-                date = (today - timedelta(days=4-i)).strftime('%Y-%m-%d')
-                stats.append({
-                    'date': date,
-                    'visitors': count
-                })
-    except:
-        pass
+        stats.append({
+            'date': date,
+            'visitors': int(count) if isinstance(count, (int, float)) else 0
+        })
     
     return stats
 
@@ -212,6 +207,12 @@ def get_recent_posts(blog_id):
             'success': True
         })
         
+    except requests.exceptions.RequestException as e:
+        return jsonify({
+            'error': f'네트워크 오류: {str(e)}',
+            'blog_id': blog_id,
+            'success': False
+        }), 500
     except Exception as e:
         return jsonify({
             'error': f'게시글을 가져올 수 없습니다: {str(e)}',
