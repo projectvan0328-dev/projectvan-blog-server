@@ -8,257 +8,162 @@ from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 
 app = Flask(__name__)
-CORS(app)  # CORS 허용
+CORS(app)
+
+@app.route('/health', methods=['GET'])
+def health():
+    """서버 상태 확인"""
+    return jsonify({'status': 'ok', 'message': '네이버 블로그 트래커 API 서버가 정상 작동 중입니다.'})
+
 
 @app.route('/api/visitor-stats/<blog_id>', methods=['GET'])
 def get_visitor_stats(blog_id):
     """
     네이버 블로그의 방문자 통계 가져오기
-    방문자 그래프 위젯이 설정되어 있어야 함
     """
     try:
-        # 네이버 블로그 메인 페이지 요청
-        blog_url = f'https://blog.naver.com/{blog_id}'
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Referer': f'https://blog.naver.com/{blog_id}'
         }
         
-        response = requests.get(blog_url, headers=headers, timeout=10)
+        # 방문자 통계 위젯 URL (네이버 블로그 위젯 API)
+        widget_url = f'https://blog.naver.com/widgetblogstats.nhn?blogId={blog_id}'
+        
+        response = requests.get(widget_url, headers=headers, timeout=10)
         response.raise_for_status()
         
         # HTML 파싱
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 방문자 그래프 데이터 찾기
-        # 네이버 블로그는 iframe을 사용하므로 실제 위젯 데이터를 찾아야 함
-        visitor_stats = extract_visitor_data(soup, blog_id, headers)
+        # 방문자 데이터 추출 시도
+        visitor_stats = []
         
+        # 방법 1: JavaScript 변수에서 데이터 추출
+        scripts = soup.find_all('script')
+        for script in scripts:
+            if script.string:
+                # visitorCntList 같은 변수 찾기
+                match = re.search(r'var\s+\w*[Vv]isitor\w*\s*=\s*(\[.*?\]);', script.string, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        visitor_stats = format_visitor_data(data)
+                        break
+                    except:
+                        continue
+                
+                # 다른 형태의 데이터 구조
+                match = re.search(r'visitorData\s*:\s*(\[.*?\])', script.string, re.DOTALL)
+                if match:
+                    try:
+                        data = json.loads(match.group(1))
+                        visitor_stats = format_visitor_data(data)
+                        break
+                    except:
+                        continue
+        
+        # 방법 2: 테이블에서 직접 파싱
         if not visitor_stats:
-            # 데이터를 찾을 수 없는 경우 빈 배열 반환
+            visitor_stats = extract_from_table(soup)
+        
+        if visitor_stats:
+            return jsonify({
+                'blog_id': blog_id,
+                'stats': visitor_stats,
+                'success': True
+            })
+        else:
             return jsonify({
                 'blog_id': blog_id,
                 'stats': [],
+                'success': False,
                 'message': '방문자 그래프 위젯이 설정되어 있지 않거나 데이터를 찾을 수 없습니다.'
-            }), 404
+            })
         
+    except Exception as e:
         return jsonify({
+            'error': f'방문자 통계를 가져올 수 없습니다: {str(e)}',
             'blog_id': blog_id,
-            'stats': visitor_stats,
-            'success': True
-        })
-        
-    except requests.RequestException as e:
-        return jsonify({
-            'error': f'블로그에 접근할 수 없습니다: {str(e)}',
-            'blog_id': blog_id
-        }), 500
-    except Exception as e:
-        return jsonify({
-            'error': f'오류가 발생했습니다: {str(e)}',
-            'blog_id': blog_id
+            'stats': [],
+            'success': False
         }), 500
 
 
-def extract_visitor_data(soup, blog_id, headers):
-    """
-    HTML에서 방문자 그래프 데이터 추출
-    네이버 블로그는 위젯이 iframe으로 로드되므로 별도 요청이 필요할 수 있음
-    """
+def format_visitor_data(data):
+    """방문자 데이터 포맷팅"""
     stats = []
+    today = datetime.now()
     
-    try:
-        # 방문자 그래프 위젯의 iframe이나 스크립트 찾기
-        # 실제 구조는 네이버 블로그 페이지를 직접 분석하여 확인 필요
-        
-        # 방법 1: 페이지 내 스크립트에서 방문자 데이터 찾기
-        scripts = soup.find_all('script')
-        for script in scripts:
-            if script.string and 'visitor' in script.string.lower():
-                # 방문자 관련 데이터가 있는 스크립트 파싱
-                visitor_data = parse_visitor_script(script.string)
-                if visitor_data:
-                    return visitor_data
-        
-        # 방법 2: 방문자 그래프 iframe 찾기
-        visitor_iframe = soup.find('iframe', {'id': re.compile('.*visitor.*', re.I)})
-        if visitor_iframe and visitor_iframe.get('src'):
-            iframe_url = visitor_iframe['src']
-            if not iframe_url.startswith('http'):
-                iframe_url = 'https://blog.naver.com' + iframe_url
+    if isinstance(data, list):
+        for i, count in enumerate(data[-5:]):  # 최근 5일
+            date = (today - timedelta(days=4-i)).strftime('%Y-%m-%d')
+            if isinstance(count, dict):
+                visitors = count.get('count', 0) or count.get('visitors', 0)
+            else:
+                visitors = int(count) if count else 0
             
-            iframe_response = requests.get(iframe_url, headers=headers, timeout=10)
-            iframe_soup = BeautifulSoup(iframe_response.text, 'html.parser')
-            
-            # iframe 내부에서 방문자 데이터 추출
-            visitor_data = parse_visitor_widget(iframe_soup)
-            if visitor_data:
-                return visitor_data
-        
-        # 방법 3: 공개된 방문자 수 위젯 찾기
-        visitor_element = soup.find('div', {'class': re.compile('.*visitor.*', re.I)})
-        if visitor_element:
-            visitor_data = parse_visitor_element(visitor_element)
-            if visitor_data:
-                return visitor_data
-        
-    except Exception as e:
-        print(f"방문자 데이터 추출 중 오류: {str(e)}")
+            stats.append({
+                'date': date,
+                'visitors': visitors
+            })
     
-    return None
+    return stats
 
 
-def parse_visitor_script(script_content):
-    """
-    스크립트 내용에서 방문자 데이터 파싱
-    """
+def extract_from_table(soup):
+    """테이블 형태에서 방문자 데이터 추출"""
+    stats = []
+    today = datetime.now()
+    
     try:
-        # JSON 형태의 데이터 찾기
-        json_match = re.search(r'visitor.*?(\[.*?\])', script_content, re.DOTALL)
-        if json_match:
-            data = json.loads(json_match.group(1))
-            return format_visitor_stats(data)
+        # 방문자 수가 표시된 요소 찾기
+        visitor_elements = soup.find_all(text=re.compile(r'\d+'))
         
-        # 숫자 배열 찾기
-        numbers = re.findall(r'\d+', script_content)
+        # 숫자만 추출
+        numbers = []
+        for elem in visitor_elements[:10]:  # 최대 10개
+            try:
+                num = int(re.search(r'\d+', elem).group())
+                if num > 0:
+                    numbers.append(num)
+            except:
+                continue
+        
+        # 최근 5일치 데이터 생성
         if len(numbers) >= 5:
-            return create_stats_from_numbers(numbers[-5:])
-            
-    except Exception as e:
-        print(f"스크립트 파싱 오류: {str(e)}")
-    
-    return None
-
-
-def parse_visitor_widget(soup):
-    """
-    방문자 위젯 HTML에서 데이터 파싱
-    """
-    try:
-        # 그래프 데이터 포인트 찾기
-        data_elements = soup.find_all(['span', 'div'], {'class': re.compile('.*count.*|.*visitor.*', re.I)})
-        
-        visitors = []
-        for elem in data_elements:
-            text = elem.get_text(strip=True)
-            if text.isdigit():
-                visitors.append(int(text))
-        
-        if len(visitors) >= 5:
-            return create_stats_from_numbers(visitors[-5:])
-            
-    except Exception as e:
-        print(f"위젯 파싱 오류: {str(e)}")
-    
-    return None
-
-
-def parse_visitor_element(element):
-    """
-    방문자 요소에서 데이터 파싱
-    """
-    try:
-        text = element.get_text()
-        numbers = re.findall(r'\d+', text)
-        
-        if numbers:
-            # 오늘 방문자 수만 있는 경우
-            today_visitors = int(numbers[0])
-            # 5일치 데이터 추정 생성
-            return create_estimated_stats(today_visitors)
-            
-    except Exception as e:
-        print(f"요소 파싱 오류: {str(e)}")
-    
-    return None
-
-
-def create_stats_from_numbers(numbers):
-    """
-    숫자 배열로부터 통계 생성
-    """
-    stats = []
-    today = datetime.now()
-    
-    for i, visitors in enumerate(numbers[-5:]):
-        date = today - timedelta(days=4-i)
-        stats.append({
-            'date': date.strftime('%m/%d'),
-            'visitors': int(visitors)
-        })
-    
-    return stats
-
-
-def create_estimated_stats(today_visitors):
-    """
-    오늘 방문자 수를 기반으로 추정 통계 생성
-    """
-    stats = []
-    today = datetime.now()
-    
-    for i in range(5):
-        date = today - timedelta(days=4-i)
-        # 랜덤한 변동을 주어 추정값 생성 (±20%)
-        import random
-        variation = random.uniform(0.8, 1.2)
-        estimated_visitors = int(today_visitors * variation)
-        
-        stats.append({
-            'date': date.strftime('%m/%d'),
-            'visitors': estimated_visitors
-        })
-    
-    return stats
-
-
-def format_visitor_stats(data):
-    """
-    데이터를 표준 형식으로 변환
-    """
-    stats = []
-    today = datetime.now()
-    
-    for i, visitors in enumerate(data[-5:]):
-        date = today - timedelta(days=4-i)
-        stats.append({
-            'date': date.strftime('%m/%d'),
-            'visitors': visitors if isinstance(visitors, int) else int(visitors)
-        })
+            for i, count in enumerate(numbers[-5:]):
+                date = (today - timedelta(days=4-i)).strftime('%Y-%m-%d')
+                stats.append({
+                    'date': date,
+                    'visitors': count
+                })
+    except:
+        pass
     
     return stats
 
 
 @app.route('/api/recent-posts/<blog_id>', methods=['GET'])
 def get_recent_posts(blog_id):
-    """
-    네이버 블로그의 최신 게시글 가져오기 (RSS 피드 사용)
-    """
+    """네이버 블로그의 최신 게시글 가져오기 (RSS 피드 사용)"""
     try:
-        # 쿼리 파라미터에서 limit 가져오기 (기본값: 5)
         limit = request.args.get('limit', 5, type=int)
-        limit = min(limit, 20)  # 최대 20개로 제한
+        limit = min(limit, 20)
         
-        # 네이버 블로그 RSS 피드
         rss_url = f'https://rss.blog.naver.com/{blog_id}.xml'
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        # RSS 피드 가져오기
         response = requests.get(rss_url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        # XML 파싱
         root = ET.fromstring(response.content)
         
-        # 네임스페이스 처리
-        namespaces = {
-            'atom': 'http://www.w3.org/2005/Atom',
-            'dc': 'http://purl.org/dc/elements/1.1/'
-        }
-        
-        # 게시글 추출
         posts = []
         items = root.findall('.//item')[:limit]
         
@@ -280,12 +185,9 @@ def get_recent_posts(blog_id):
                     title = title_elem.text or ''
                     url = link_elem.text or ''
                     
-                    # 날짜 파싱
                     if date_elem is not None and date_elem.text:
                         try:
-                            # RSS 날짜 형식: "Tue, 24 Oct 2023 12:00:00 +0900"
                             date_str = date_elem.text
-                            # 간단한 날짜 추출
                             date_parts = date_str.split()
                             if len(date_parts) >= 4:
                                 date_formatted = f"{date_parts[1]} {date_parts[2]} {date_parts[3]}"
@@ -319,10 +221,9 @@ def get_recent_posts(blog_id):
 
 
 @app.route('/api/check-exposure', methods=['POST'])
-def check_post_exposure():
+def check_exposure():
     """
-    게시글이 네이버 VIEW 블로그 탭에 노출되는지 확인
-    게시글 제목을 검색했을 때 결과에 나타나는지 체크
+    게시글이 네이버 VIEW 탭에 노출되는지 확인
     """
     try:
         data = request.get_json()
@@ -333,43 +234,32 @@ def check_post_exposure():
         if not all([blog_id, post_title, post_url]):
             return jsonify({'error': '필수 파라미터가 누락되었습니다.'}), 400
         
-        # 네이버 통합검색 - VIEW 블로그 탭 검색
-        search_url = 'https://search.naver.com/search.naver'
-        params = {
-            'where': 'view',  # VIEW 탭
-            'sm': 'tab_jum',
-            'query': post_title
-        }
+        # 네이버 검색으로 게시글 확인
+        search_query = f"{post_title} {blog_id}"
+        search_url = f"https://search.naver.com/search.naver?where=view&query={requests.utils.quote(search_query)}"
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ko-KR,ko;q=0.9'
         }
         
-        response = requests.get(search_url, params=params, headers=headers, timeout=10)
+        response = requests.get(search_url, headers=headers, timeout=10)
         response.raise_for_status()
         
-        # HTML 파싱
         soup = BeautifulSoup(response.text, 'html.parser')
         
         # 검색 결과에서 해당 게시글 URL 찾기
-        # VIEW 탭의 블로그 검색 결과 영역
-        search_results = soup.find_all('a', href=True)
-        
+        post_number = post_url.split('/')[-1]
         exposed = False
-        for link in search_results:
-            href = link.get('href', '')
-            # 게시글 URL이 검색 결과에 포함되어 있는지 확인
-            if post_url in href or blog_id in href:
-                # 실제 게시글 번호 확인
-                post_id = post_url.split('/')[-1]
-                if post_id in href:
-                    exposed = True
-                    break
         
-        # 검색 결과가 전혀 없는지 확인
-        no_results = soup.find('div', {'class': re.compile('not_found|no_result')})
-        if no_results:
-            exposed = False
+        # 검색 결과 링크들 확인
+        links = soup.find_all('a', href=True)
+        for link in links:
+            href = link.get('href', '')
+            if blog_id in href and post_number in href:
+                exposed = True
+                break
         
         return jsonify({
             'blog_id': blog_id,
@@ -379,120 +269,12 @@ def check_post_exposure():
             'checked_at': datetime.now().isoformat()
         })
         
-    except requests.RequestException as e:
+    except Exception as e:
         return jsonify({
             'error': f'검색 확인 중 오류: {str(e)}',
             'exposed': None
         }), 500
-    except Exception as e:
-        return jsonify({
-            'error': f'오류가 발생했습니다: {str(e)}',
-            'exposed': None
-        }), 500
-
-
-@app.route('/api/all-data', methods=['POST'])
-def get_all_data():
-    """
-    여러 블로그의 데이터를 한번에 가져오기
-    """
-    try:
-        data = request.get_json()
-        blog_ids = data.get('blog_ids', [])
-        
-        if not blog_ids:
-            return jsonify({'error': '블로그 ID가 제공되지 않았습니다.'}), 400
-        
-        results = {
-            'visitor_stats': {},
-            'recent_posts': []
-        }
-        
-        # 각 블로그의 데이터 수집
-        for blog_id in blog_ids:
-            # 방문자 통계
-            try:
-                blog_url = f'https://blog.naver.com/{blog_id}'
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-                response = requests.get(blog_url, headers=headers, timeout=10)
-                soup = BeautifulSoup(response.text, 'html.parser')
-                visitor_stats = extract_visitor_data(soup, blog_id, headers)
-                
-                if visitor_stats:
-                    results['visitor_stats'][blog_id] = visitor_stats
-            except Exception as e:
-                print(f"블로그 {blog_id} 방문자 통계 오류: {str(e)}")
-            
-            # 최신 게시글
-            try:
-                rss_url = f'https://rss.blog.naver.com/{blog_id}.xml'
-                response = requests.get(rss_url, headers=headers, timeout=10)
-                root = ET.fromstring(response.content)
-                
-                items = root.findall('.//item')[:5]
-                for item in items:
-                    try:
-                        title_elem = item.find('title')
-                        link_elem = item.find('link')
-                        date_elem = item.find('pubDate')
-                        
-                        if title_elem is not None and link_elem is not None:
-                            title = title_elem.text or ''
-                            url = link_elem.text or ''
-                            
-                            if date_elem is not None and date_elem.text:
-                                date_str = date_elem.text
-                                date_parts = date_str.split()
-                                if len(date_parts) >= 4:
-                                    date_formatted = f"{date_parts[1]} {date_parts[2]} {date_parts[3]}"
-                                else:
-                                    date_formatted = date_str[:16]
-                            else:
-                                date_formatted = 'Unknown'
-                            
-                            results['recent_posts'].append({
-                                'blog_id': blog_id,
-                                'title': title,
-                                'url': url,
-                                'date': date_formatted,
-                                'timestamp': date_str if date_elem is not None else ''
-                            })
-                    except:
-                        continue
-            except Exception as e:
-                print(f"블로그 {blog_id} 게시글 오류: {str(e)}")
-        
-        # 게시글을 날짜순으로 정렬
-        results['recent_posts'].sort(key=lambda x: x['timestamp'], reverse=True)
-        results['recent_posts'] = results['recent_posts'][:5]
-        
-        return jsonify(results)
-        
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """
-    서버 상태 확인
-    """
-    return jsonify({'status': 'healthy', 'message': '네이버 블로그 트래커 API 서버가 정상 작동 중입니다.'})
 
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("네이버 블로그 트래커 API 서버 시작")
-    print("=" * 60)
-    print("서버 주소: http://localhost:5000")
-    print("\nAPI 엔드포인트:")
-    print("  - GET  /health")
-    print("  - GET  /api/visitor-stats/<blog_id>")
-    print("  - GET  /api/recent-posts/<blog_id>?limit=N")
-    print("  - POST /api/check-exposure")
-    print("  - POST /api/all-data")
-    print("=" * 60)
-    
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000, debug=False)
